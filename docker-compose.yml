@@ -1,0 +1,18 @@
+services:
+  fuel-monitor:
+    build: .
+    container_name: fuel-monitor
+    environment:
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-yar.pisarev11@gmail.com}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM: ${EMAIL_FROM:-yar.pisarev11@gmail.com}
+      EMAIL_TO: ${EMAIL_TO:-yar.pisarev11@gmail.com}
+      FUEL_DB_PATH: /data/fuel_monitor.sqlite3
+      FUEL_TIMEZONE: ${FUEL_TIMEZONE:-Europe/Kyiv}
+      FUEL_SCHEDULE: ${FUEL_SCHEDULE:-*/5 * * * *}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
