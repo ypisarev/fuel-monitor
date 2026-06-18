@@ -198,7 +198,7 @@ def build_message(
                         """
                 )
 
-        chart_svg = build_history_chart_svg(history_by_source, base_price, history_days)
+        chart_svg = build_history_chart_svg(history_by_source, base_price, alert_threshold, history_days)
         top_banner_bg = "linear-gradient(135deg,#166534,#22c55e)" if alert_state == "ok" else "linear-gradient(135deg,#7f1d1d,#ef4444)"
         top_banner_text = "Все ок" if alert_state == "ok" else "Внимание: отклонение больше 5%"
         top_banner_note = "Текущие цены в норме." if alert_state == "ok" else "Одна или несколько цен вышли за допустимый диапазон."
@@ -342,6 +342,7 @@ def calculate_alert_state(current_price: float, base_price: float, threshold: fl
 def build_history_chart_svg(
     history_by_source: dict[str, list[HistoryPoint]],
     base_price: float,
+    alert_threshold: float,
     history_days: int,
 ) -> str:
     all_points = [point for points in history_by_source.values() for point in points]
@@ -352,80 +353,110 @@ def build_history_chart_svg(
     if not ordered_days:
         return ""
 
-    values = [base_price] + [point.price for point in all_points]
+    lower_bound = base_price * (1 - alert_threshold)
+    upper_bound = base_price * (1 + alert_threshold)
+    values = [lower_bound, base_price, upper_bound] + [point.price for point in all_points]
     min_value = min(values)
     max_value = max(values)
     value_range = max(max_value - min_value, 1.0)
-    min_value -= value_range * 0.15
-    max_value += value_range * 0.15
+    min_value -= value_range * 0.12
+    max_value += value_range * 0.12
     adjusted_range = max(max_value - min_value, 1.0)
 
-    palette = {"Украина": "#2563eb", "Запорожская обл.": "#dc2626"}
+    palette = {"Украина": "#52525b", "Запорожская обл.": "#ef4444"}
+
+    width = 760
+    height = 280
+    plot_left = 54
+    plot_right = 22
+    plot_top = 18
+    plot_bottom = 42
+    plot_width = width - plot_left - plot_right
+    plot_height = height - plot_top - plot_bottom
+
+    def value_to_y(value: float) -> float:
+        normalized = (value - min_value) / adjusted_range
+        normalized = max(0.0, min(1.0, normalized))
+        return plot_top + (1 - normalized) * plot_height
+
+    def day_to_x(index: int) -> float:
+        if len(ordered_days) == 1:
+            return plot_left + plot_width / 2
+        return plot_left + (index * plot_width / (len(ordered_days) - 1))
+
+    tick_count = 5
+    tick_step = adjusted_range / (tick_count - 1)
+    y_ticks = [min_value + tick_step * index for index in range(tick_count)]
 
     legend_items = []
     for source_name, color in palette.items():
         if source_name in history_by_source:
             legend_items.append(
-                f"<div style='display:flex;align-items:center;gap:8px;margin-right:16px;'><span style='width:12px;height:12px;border-radius:999px;background:{color};display:inline-block;'></span><span>{escape(source_name)}</span></div>"
+                f"<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:12px;border-radius:999px;background:{color};display:inline-block;'></span><span>{escape(source_name)}</span></div>"
             )
-    legend_items.append(
-        "<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:12px;border-radius:999px;background:#16a34a;display:inline-block;'></span><span>Базовая цена 79.99</span></div>"
+    legend_items.extend(
+        [
+            f"<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:2px;background:#16a34a;display:inline-block;'></span><span>Цель {base_price:.2f} грн/л</span></div>",
+            f"<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:2px;background:#86efac;display:inline-block;opacity:.8;'></span><span>Границы ±{alert_threshold * 100:.0f}%</span></div>",
+        ]
     )
 
-    chart_rows = []
-    chart_height = 190
-    bar_area_height = 150
+    grid_lines = []
+    for tick_value in y_ticks:
+        y = value_to_y(tick_value)
+        grid_lines.append(
+            f"<line x1='{plot_left}' y1='{y:.1f}' x2='{plot_left + plot_width}' y2='{y:.1f}' stroke='#e2e8f0' stroke-width='1'/>"
+        )
+        grid_lines.append(
+            f"<text x='{plot_left - 10}' y='{y + 4:.1f}' text-anchor='end' font-size='11' fill='#64748b'>{tick_value:.0f}</text>"
+        )
 
-    baseline_ratio = (base_price - min_value) / adjusted_range
-    baseline_ratio = max(0.0, min(1.0, baseline_ratio))
-    baseline_top = (1 - baseline_ratio) * bar_area_height
+    day_labels = []
+    for index, day in enumerate(ordered_days):
+        x = day_to_x(index)
+        day_labels.append(
+            f"<text x='{x:.1f}' y='{height - 16}' text-anchor='middle' font-size='11' fill='#64748b'>{day.strftime('%b')}</text>"
+        )
 
+    source_paths = []
     for source_name, color in palette.items():
-        if source_name not in history_by_source:
+        points = history_by_source.get(source_name)
+        if not points:
             continue
 
-        point_map = {point.day: point.price for point in history_by_source[source_name]}
-        day_cells = []
-        for day in ordered_days:
+        point_map = {point.day: point.price for point in points}
+        path_points = []
+        point_elements = []
+        for index, day in enumerate(ordered_days):
             price_value = point_map.get(day)
             if price_value is None:
-                day_cells.append(
-                    f"<div style='display:flex;flex-direction:column;align-items:center;justify-content:flex-end;flex:1;min-width:0;'>"
-                    f"<div style='height:{bar_area_height}px;width:100%;'></div>"
-                    f"<div style='font-size:11px;color:#94a3b8;margin-top:6px;'>{day.strftime('%d.%m')}</div>"
-                    f"</div>"
-                )
                 continue
-
-            normalized = (price_value - min_value) / adjusted_range
-            normalized = max(0.0, min(1.0, normalized))
-            bar_height = max(8, int(normalized * bar_area_height))
-            price_label = f"{price_value:.2f}".replace(".", ",")
-            day_cells.append(
-                f"<div style='display:flex;flex-direction:column;align-items:center;justify-content:flex-end;flex:1;min-width:0;'>"
-                f"<div style='display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:{bar_area_height}px;width:100%;position:relative;'>"
-                f"<div style='position:absolute;top:{baseline_top:.1f}px;left:6px;right:6px;height:1px;border-top:1px dashed #16a34a;opacity:.8;'></div>"
-                f"<div style='margin-bottom:6px;font-size:11px;font-weight:700;color:#0f172a;'>{price_label}</div>"
-                f"<div style='width:22px;height:{bar_height}px;background:{color};border-radius:8px 8px 3px 3px;box-shadow:0 8px 16px rgba(15,23,42,.12);'></div>"
-                f"</div>"
-                f"<div style='font-size:11px;color:#64748b;margin-top:6px;'>{day.strftime('%d.%m')}</div>"
-                f"</div>"
+            x = day_to_x(index)
+            y = value_to_y(price_value)
+            path_points.append((x, y, price_value))
+            point_elements.append(
+                f"<circle cx='{x:.1f}' cy='{y:.1f}' r='4.8' fill='#fff' stroke='{color}' stroke-width='2'/>"
             )
 
-        chart_rows.append(
+        if not path_points:
+            continue
+
+        path_d = "M " + " L ".join(f"{x:.1f} {y:.1f}" for x, y, _ in path_points)
+        last_x, last_y, last_value = path_points[-1]
+        source_paths.append(
             f"""
-            <div style='border:1px solid #e2e8f0;border-radius:14px;padding:14px 14px 10px;background:#f8fafc;'>
-              <div style='display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap;'>
-                <div style='font-weight:700;color:#0f172a;'>{escape(source_name)}</div>
-                <div style='font-size:12px;color:#475569;'>база {base_price:.2f} грн/л</div>
-              </div>
-              <div style='display:flex;align-items:flex-end;gap:8px;height:{chart_height}px;position:relative;'>
-                <div style='position:absolute;left:0;right:0;top:{baseline_top:.1f}px;border-top:1px dashed #16a34a;opacity:.8;'></div>
-                {''.join(day_cells)}
-              </div>
-            </div>
+            <g>
+              <path d='{path_d}' fill='none' stroke='{color}' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/>
+              {''.join(point_elements)}
+              <circle cx='{last_x:.1f}' cy='{last_y:.1f}' r='7.5' fill='none' stroke='{color}' stroke-width='1' opacity='.18'/>
+              <text x='{last_x:.1f}' y='{last_y - 12:.1f}' text-anchor='middle' font-size='11' font-weight='700' fill='#0f172a'>{last_value:.2f}</text>
+            </g>
             """
         )
+
+    target_y = value_to_y(base_price)
+    lower_y = value_to_y(lower_bound)
+    upper_y = value_to_y(upper_bound)
 
     return f"""
     <div style='background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:16px 16px 12px;margin-top:18px;'>
@@ -438,9 +469,22 @@ def build_history_chart_svg(
           {''.join(legend_items)}
         </div>
       </div>
-            <div style='display:grid;grid-template-columns:1fr;gap:12px;'>
-                {''.join(chart_rows)}
-            </div>
+      <div style='overflow-x:auto;'>
+        <svg viewBox='0 0 {width} {height}' width='100%' height='auto' role='img' aria-label='График цен на дизельное топливо'>
+          <rect x='0' y='0' width='{width}' height='{height}' fill='#ffffff'/>
+          <line x1='{plot_left}' y1='{upper_y:.1f}' x2='{plot_left + plot_width}' y2='{upper_y:.1f}' stroke='#86efac' stroke-width='1' stroke-dasharray='2 6' opacity='.35'/>
+          <line x1='{plot_left}' y1='{target_y:.1f}' x2='{plot_left + plot_width}' y2='{target_y:.1f}' stroke='#16a34a' stroke-width='1.5'/>
+          <line x1='{plot_left}' y1='{lower_y:.1f}' x2='{plot_left + plot_width}' y2='{lower_y:.1f}' stroke='#86efac' stroke-width='1' stroke-dasharray='2 6' opacity='.35'/>
+          {''.join(grid_lines)}
+          <line x1='{plot_left}' y1='{plot_top}' x2='{plot_left}' y2='{plot_top + plot_height}' stroke='#cbd5e1' stroke-width='1'/>
+          <line x1='{plot_left}' y1='{plot_top + plot_height}' x2='{plot_left + plot_width}' y2='{plot_top + plot_height}' stroke='#cbd5e1' stroke-width='1'/>
+          {''.join(source_paths)}
+          {''.join(day_labels)}
+          <text x='{plot_left + plot_width - 4}' y='{target_y - 6:.1f}' text-anchor='end' font-size='11' fill='#15803d'>цель {base_price:.2f}</text>
+          <text x='{plot_left + plot_width - 4}' y='{upper_y - 6:.1f}' text-anchor='end' font-size='10' fill='#86efac' opacity='.75'>+{alert_threshold * 100:.0f}%</text>
+          <text x='{plot_left + plot_width - 4}' y='{lower_y + 14:.1f}' text-anchor='end' font-size='10' fill='#86efac' opacity='.75'>-{alert_threshold * 100:.0f}%</text>
+        </svg>
+      </div>
     </div>
     """
 
