@@ -9,6 +9,7 @@ __pycache__/
 # DB
 *.sqlite3
 data/*
+data/fuel_monitor.sqlite3
 # Distribution / packaging
 .Python
 build/
