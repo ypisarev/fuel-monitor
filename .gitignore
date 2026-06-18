@@ -8,7 +8,7 @@ __pycache__/
 
 # DB
 *.sqlite3
-
+data/*
 # Distribution / packaging
 .Python
 build/
