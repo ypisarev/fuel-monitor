@@ -148,6 +148,14 @@ def parse_snapshot(source_name: str, url: str) -> FuelSnapshot:
     )
 
 
+def localize_source_name(source_name: str) -> str:
+    mapping = {
+        "Украина": "Україна",
+        "Запорожская обл.": "Запорізька обл.",
+    }
+    return mapping.get(source_name, source_name)
+
+
 def build_message(
         snapshots: list[FuelSnapshot],
         history_by_source: dict[str, list[HistoryPoint]],
@@ -157,90 +165,92 @@ def build_message(
         recipient: str,
         sender: str,
 ) -> EmailMessage:
-        subject_date = snapshots[0].updated_at or "сейчас"
-        alert_state = "alert" if any(
-                abs(float(snapshot.diesel.price.replace(",", ".")) - base_price) / base_price > alert_threshold
-                for snapshot in snapshots
-        ) else "ok"
-        subject_prefix = "ALERT" if alert_state == "alert" else "OK"
-        subject = f"{subject_prefix}: дизель {subject_date}"
+    subject_date = snapshots[0].updated_at or "зараз"
+    alert_state = "alert" if any(
+        abs(float(snapshot.diesel.price.replace(",", ".")) - base_price) / base_price > alert_threshold
+        for snapshot in snapshots
+    ) else "ok"
+    subject_prefix = "УВАГА" if alert_state == "alert" else "ОК"
+    subject = f"{subject_prefix}: дизель {subject_date}"
 
-        text_lines = [f"Статус: {'ВНИМАНИЕ' if alert_state == 'alert' else 'ОК'}", "", "Текущие цены на дизельное топливо:"]
-        for snapshot in snapshots:
-                price_value = float(snapshot.diesel.price.replace(",", "."))
-                state, deviation, deviation_ratio = calculate_alert_state(price_value, base_price, alert_threshold)
-                parts = [
-                        f"{snapshot.source_name}: {snapshot.diesel.price} грн/л",
-                        f"отклонение {deviation:+.2f} грн ({deviation_ratio * 100:.2f}%)",
-                ]
-                if snapshot.diesel.change is not None:
-                        parts.append(f"изменение {snapshot.diesel.change}")
-                if snapshot.updated_at:
-                        parts.append(f"обновлено {snapshot.updated_at}")
-                parts.append("ALERT" if state == "alert" else "OK")
-                text_lines.append("; ".join(parts))
-        text_lines.extend(["", "Источники:"])
-        text_lines.extend(f"- {snapshot.source_name}: {snapshot.url}" for snapshot in snapshots)
+    text_lines = [f"Статус: {'УВАГА' if alert_state == 'alert' else 'ОК'}", "", "Поточні ціни на дизельне пальне:"]
+    for snapshot in snapshots:
+        display_source_name = localize_source_name(snapshot.source_name)
+        price_value = float(snapshot.diesel.price.replace(",", "."))
+        state, deviation, deviation_ratio = calculate_alert_state(price_value, base_price, alert_threshold)
+        parts = [
+            f"{display_source_name}: {snapshot.diesel.price} грн/л",
+            f"відхилення {deviation:+.2f} грн ({deviation_ratio * 100:.2f}%)",
+        ]
+        if snapshot.diesel.change is not None:
+            parts.append(f"зміна {snapshot.diesel.change}")
+        if snapshot.updated_at:
+            parts.append(f"оновлено {snapshot.updated_at}")
+        parts.append("УВАГА" if state == "alert" else "ОК")
+        text_lines.append("; ".join(parts))
+    text_lines.extend(["", "Джерела:"])
+    text_lines.extend(f"- {localize_source_name(snapshot.source_name)}: {snapshot.url}" for snapshot in snapshots)
 
-        summary_cards = []
-        for snapshot in snapshots:
-                price_value = float(snapshot.diesel.price.replace(",", "."))
-                state, deviation, deviation_ratio = calculate_alert_state(price_value, base_price, alert_threshold)
-                badge_bg = "#dcfce7" if state == "ok" else "#fee2e2"
-                badge_fg = "#166534" if state == "ok" else "#991b1b"
-                card_border = "#86efac" if state == "ok" else "#fca5a5"
-                summary_cards.append(
-                        f"""
-                        <div style='border:1px solid {card_border};border-radius:16px;padding:14px 16px;background:#fff;'>
-                            <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;'>
-                                <div style='font-weight:700;font-size:16px;color:#0f172a;'>{escape(snapshot.source_name)}</div>
-                                <div style='padding:4px 10px;border-radius:999px;background:{badge_bg};color:{badge_fg};font-size:12px;font-weight:700;'>{'ОК' if state == 'ok' else 'ТРЕВОГА'}</div>
-                            </div>
-                            <div style='margin-top:8px;font-size:28px;font-weight:800;color:#0f172a;'>{escape(snapshot.diesel.price)} <span style='font-size:14px;font-weight:600;color:#475569;'>грн/л</span></div>
-                            <div style='margin-top:6px;font-size:13px;color:#475569;'>Отклонение от 79.99: {deviation:+.2f} грн ({deviation_ratio * 100:.2f}%)</div>
-                        </div>
-                        """
-                )
-
-        chart_image = build_history_image(history_by_source, base_price, alert_threshold, history_days)
-        top_banner_bg = "linear-gradient(135deg,#166534,#22c55e)" if alert_state == "ok" else "linear-gradient(135deg,#7f1d1d,#ef4444)"
-        top_banner_text = "Все ок" if alert_state == "ok" else "Внимание: отклонение больше 5%"
-        top_banner_note = "Текущие цены в норме." if alert_state == "ok" else "Одна или несколько цен вышли за допустимый диапазон."
-
-        html_body = f"""
-        <html>
-            <body style='margin:0;padding:0;background:#f8fafc;font-family:Arial,Helvetica,sans-serif;color:#0f172a;'>
-                <div style='max-width:820px;margin:0 auto;padding:24px;'>
-                    <div style='background:{top_banner_bg};color:#fff;border-radius:18px;padding:24px 28px;margin-bottom:20px;'>
-                        <div style='font-size:13px;letter-spacing:.08em;text-transform:uppercase;opacity:.85;'>Fuel monitor</div>
-                        <h1 style='margin:10px 0 0;font-size:28px;line-height:1.2;'>{top_banner_text}</h1>
-                        <p style='margin:10px 0 0;font-size:15px;opacity:.92;'>{top_banner_note}</p>
-                    </div>
-                    <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;'>
-                        {''.join(summary_cards)}
-                    </div>
-                    <div style='margin-top:18px;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden;background:#fff;'>
-                        <img src='cid:fuel_chart' alt='График истории цен' style='display:block;width:100%;height:auto;border:0;outline:none;text-decoration:none;'>
-                    </div>
-                    <div style='margin-top:18px;padding:14px 16px;background:#fff;border:1px solid #e2e8f0;border-radius:16px;font-size:13px;color:#475569;'>
-                        <div><strong>Кому:</strong> {escape(recipient)}</div>
-                        <div><strong>От:</strong> {escape(sender)}</div>
-                        <div style='margin-top:6px;'><strong>База:</strong> {base_price:.2f} грн/л; <strong>Порог:</strong> {alert_threshold * 100:.0f}%</div>
-                    </div>
-                    <div style='margin-top:16px;font-size:13px;color:#64748b;'>Источники: {''.join(f"<a href='{escape(snapshot.url)}' style='color:#1d4ed8;text-decoration:none;'>{escape(snapshot.source_name)}</a>{' · ' if i < len(snapshots)-1 else ''}" for i, snapshot in enumerate(snapshots))}</div>
+    summary_cards = []
+    for snapshot in snapshots:
+        display_source_name = localize_source_name(snapshot.source_name)
+        price_value = float(snapshot.diesel.price.replace(",", "."))
+        state, deviation, deviation_ratio = calculate_alert_state(price_value, base_price, alert_threshold)
+        badge_bg = "#dcfce7" if state == "ok" else "#fee2e2"
+        badge_fg = "#166534" if state == "ok" else "#991b1b"
+        card_border = "#86efac" if state == "ok" else "#fca5a5"
+        summary_cards.append(
+            f"""
+            <div style='border:1px solid {card_border};border-radius:16px;padding:14px 16px;background:#fff;'>
+                <div style='display:flex;justify-content:space-between;gap:10px;align-items:center;'>
+                    <div style='font-weight:700;font-size:16px;color:#0f172a;'>{escape(display_source_name)}</div>
+                    <div style='padding:4px 10px;border-radius:999px;background:{badge_bg};color:{badge_fg};font-size:12px;font-weight:700;'>{'ОК' if state == 'ok' else 'ТРИВОГА'}</div>
                 </div>
-            </body>
-        </html>
-        """
+                <div style='margin-top:8px;font-size:28px;font-weight:800;color:#0f172a;'>{escape(snapshot.diesel.price)} <span style='font-size:14px;font-weight:600;color:#475569;'>грн/л</span></div>
+                <div style='margin-top:6px;font-size:13px;color:#475569;'>Відхилення від {base_price:.2f}: {deviation:+.2f} грн ({deviation_ratio * 100:.2f}%)</div>
+            </div>
+            """
+        )
 
-        message = EmailMessage()
-        message["To"] = recipient
-        message["From"] = sender
-        message["Subject"] = subject
-        message.set_content("\n".join(text_lines))
-        message.add_alternative(html_body, subtype="html")
-        message.get_payload()[1].add_related(chart_image, "image", "png", cid="fuel_chart")
-        return message
+    chart_image = build_history_image(history_by_source, base_price, alert_threshold, history_days)
+    top_banner_bg = "linear-gradient(135deg,#166534,#22c55e)" if alert_state == "ok" else "linear-gradient(135deg,#7f1d1d,#ef4444)"
+    top_banner_text = "Усе добре" if alert_state == "ok" else "Увага: відхилення понад 5%"
+    top_banner_note = "Поточні ціни в межах норми." if alert_state == "ok" else "Одна або кілька цін вийшли за допустимий діапазон."
+
+    html_body = f"""
+    <html>
+        <body style='margin:0;padding:0;background:#f8fafc;font-family:Arial,Helvetica,sans-serif;color:#0f172a;'>
+            <div style='max-width:820px;margin:0 auto;padding:24px;'>
+                <div style='background:{top_banner_bg};color:#fff;border-radius:18px;padding:24px 28px;margin-bottom:20px;'>
+                    <div style='font-size:13px;letter-spacing:.08em;text-transform:uppercase;opacity:.85;'>Моніторинг цін на пальне</div>
+                    <h1 style='margin:10px 0 0;font-size:28px;line-height:1.2;'>{top_banner_text}</h1>
+                    <p style='margin:10px 0 0;font-size:15px;opacity:.92;'>{top_banner_note}</p>
+                </div>
+                <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;'>
+                    {''.join(summary_cards)}
+                </div>
+                <div style='margin-top:18px;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden;background:#fff;'>
+                    <img src='cid:fuel_chart' alt='Графік історії цін' style='display:block;width:100%;height:auto;border:0;outline:none;text-decoration:none;'>
+                </div>
+                <div style='margin-top:18px;padding:14px 16px;background:#fff;border:1px solid #e2e8f0;border-radius:16px;font-size:13px;color:#475569;'>
+                    <div><strong>Кому:</strong> {escape(recipient)}</div>
+                    <div><strong>Від:</strong> {escape(sender)}</div>
+                    <div style='margin-top:6px;'><strong>База:</strong> {base_price:.2f} грн/л; <strong>Поріг:</strong> {alert_threshold * 100:.0f}%</div>
+                </div>
+                <div style='margin-top:16px;font-size:13px;color:#64748b;'>Джерела: {''.join(f"<a href='{escape(snapshot.url)}' style='color:#1d4ed8;text-decoration:none;'>{escape(localize_source_name(snapshot.source_name))}</a>{' · ' if i < len(snapshots)-1 else ''}" for i, snapshot in enumerate(snapshots))}</div>
+            </div>
+        </body>
+    </html>
+    """
+
+    message = EmailMessage()
+    message["To"] = recipient
+    message["From"] = sender
+    message["Subject"] = subject
+    message.set_content("\n".join(text_lines))
+    message.add_alternative(html_body, subtype="html")
+    message.get_payload()[1].add_related(chart_image, "image", "png", cid="fuel_chart")
+    return message
 
 
 def ensure_database(db_path: str) -> None:
@@ -390,7 +400,19 @@ def build_history_image(
     alert_threshold: float,
     history_days: int,
 ) -> bytes:
-    all_points = [point for points in history_by_source.values() for point in points]
+    localized_history_by_source: dict[str, list[HistoryPoint]] = {}
+    for source_name, points in history_by_source.items():
+        localized_name = localize_source_name(source_name)
+        localized_history_by_source.setdefault(localized_name, []).extend(
+            [
+                HistoryPoint(source_name=localized_name, day=point.day, price=point.price)
+                for point in points
+            ]
+        )
+    for points in localized_history_by_source.values():
+        points.sort(key=lambda point: point.day)
+
+    all_points = [point for points in localized_history_by_source.values() for point in points]
     if not all_points:
         img = Image.new("RGB", (760, 260), "#f8fafc")
         return BytesIO().getvalue()
@@ -430,7 +452,7 @@ def build_history_image(
             return left + plot_width // 2
         return left + int(index * plot_width / (len(ordered_days) - 1))
 
-    palette = {"Украина": "#2563eb", "Запорожская обл.": "#dc2626"}
+    palette = {"Україна": "#2563eb", "Запорізька обл.": "#dc2626"}
 
     img = Image.new("RGB", (width, height), "#f8fafc")
     draw = ImageDraw.Draw(img)
@@ -441,13 +463,13 @@ def build_history_image(
 
     draw.rectangle([0, 0, width, height], fill="#ffffff")
     draw.rounded_rectangle([18, 18, width - 18, height - 18], radius=24, outline="#e2e8f0", width=1, fill="#ffffff")
-    draw.text((left, 34), "HISTORY", fill="#64748b", font=font_title)
-    draw.text((left, 60), f"Последние {days_to_show} дней", fill="#0f172a", font=font_bold)
+    draw.text((left, 34), "ІСТОРІЯ", fill="#64748b", font=font_title)
+    draw.text((left, 60), f"Останні {days_to_show} днів", fill="#0f172a", font=font_bold)
 
     legend_y = 42
     legend_x = width - 360
     for source_name, color in palette.items():
-        if source_name not in history_by_source:
+        if source_name not in localized_history_by_source:
             continue
         draw.ellipse([legend_x, legend_y + 6, legend_x + 12, legend_y + 18], fill=color)
         draw.text((legend_x + 18, legend_y), source_name, fill="#475569", font=font_regular)
@@ -477,9 +499,9 @@ def build_history_image(
     draw.text((34, top + plot_height // 2 - 8), "грн/л", fill="#64748b", font=font_regular)
 
     for source_name, color in palette.items():
-        if source_name not in history_by_source:
+        if source_name not in localized_history_by_source:
             continue
-        points = sorted(history_by_source[source_name], key=lambda point: point.day)
+        points = sorted(localized_history_by_source[source_name], key=lambda point: point.day)
         points = [point for point in points if point.day in ordered_days]
         coords = []
         for index, day in enumerate(ordered_days):
@@ -509,9 +531,9 @@ def build_history_image(
         label_width, _ = text_size(draw, date_label, font_small)
         draw.text((x - label_width // 2, height - bottom + 12), date_label, fill="#64748b", font=font_small)
 
-    target_label = f"Цель {base_price:.2f}"
-    upper_label = f"Верхняя граница +{alert_threshold * 100:.0f}%"
-    lower_label = f"Нижняя граница -{alert_threshold * 100:.0f}%"
+    target_label = f"Ціль {base_price:.2f}"
+    upper_label = f"Верхня межа +{alert_threshold * 100:.0f}%"
+    lower_label = f"Нижня межа -{alert_threshold * 100:.0f}%"
     draw.text((left + plot_width - text_size(draw, upper_label, font_small)[0], upper_y - 24), upper_label, fill="#86efac", font=font_small)
     draw.text((left + plot_width - text_size(draw, target_label, font_regular)[0], target_y - 28), target_label, fill="#15803d", font=font_regular)
     draw.text((left + plot_width - text_size(draw, lower_label, font_small)[0], lower_y + 8), lower_label, fill="#86efac", font=font_small)
