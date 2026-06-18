@@ -171,7 +171,7 @@ def build_message(
         for snapshot in snapshots
     ) else "ok"
     subject_prefix = "УВАГА" if alert_state == "alert" else "ОК"
-    subject = f"{subject_prefix}: дизель {subject_date}"
+    subject = f"Моніторинг цін на пальне: {subject_prefix}"
 
     text_lines = [f"Статус: {'УВАГА' if alert_state == 'alert' else 'ОК'}", "", "Поточні ціни на дизельне пальне:"]
     for snapshot in snapshots:
