@@ -12,9 +12,12 @@ import time
 from dataclasses import dataclass
 from email.message import EmailMessage
 from html import escape
+from io import BytesIO
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+from PIL import Image, ImageDraw, ImageFont
 
 
 DEFAULT_RECIPIENT = "yar.pisarev11@gmail.com"
@@ -23,7 +26,8 @@ DEFAULT_TIMEZONE = "Europe/Kyiv"
 DEFAULT_SCHEDULE = "09:00"
 DEFAULT_BASE_FUEL_PRICE = 79.99
 DEFAULT_ALERT_THRESHOLD = 0.05
-DEFAULT_HISTORY_DAYS = 5
+DEFAULT_HISTORY_DAYS = 14
+MIN_CHART_DAYS = 5
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) FuelMonitor/1.0"
 
 
@@ -198,7 +202,7 @@ def build_message(
                         """
                 )
 
-        chart_svg = build_history_chart_svg(history_by_source, base_price, alert_threshold, history_days)
+        chart_image = build_history_image(history_by_source, base_price, alert_threshold, history_days)
         top_banner_bg = "linear-gradient(135deg,#166534,#22c55e)" if alert_state == "ok" else "linear-gradient(135deg,#7f1d1d,#ef4444)"
         top_banner_text = "Все ок" if alert_state == "ok" else "Внимание: отклонение больше 5%"
         top_banner_note = "Текущие цены в норме." if alert_state == "ok" else "Одна или несколько цен вышли за допустимый диапазон."
@@ -215,7 +219,9 @@ def build_message(
                     <div style='display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;'>
                         {''.join(summary_cards)}
                     </div>
-                    {chart_svg}
+                    <div style='margin-top:18px;border:1px solid #e2e8f0;border-radius:18px;overflow:hidden;background:#fff;'>
+                        <img src='cid:fuel_chart' alt='График истории цен' style='display:block;width:100%;height:auto;border:0;outline:none;text-decoration:none;'>
+                    </div>
                     <div style='margin-top:18px;padding:14px 16px;background:#fff;border:1px solid #e2e8f0;border-radius:16px;font-size:13px;color:#475569;'>
                         <div><strong>Кому:</strong> {escape(recipient)}</div>
                         <div><strong>От:</strong> {escape(sender)}</div>
@@ -233,6 +239,7 @@ def build_message(
         message["Subject"] = subject
         message.set_content("\n".join(text_lines))
         message.add_alternative(html_body, subtype="html")
+        message.get_payload()[1].add_related(chart_image, "image", "png", cid="fuel_chart")
         return message
 
 
@@ -296,6 +303,16 @@ def store_snapshots(db_path: str, snapshots: list[FuelSnapshot]) -> None:
         connection.commit()
 
 
+def prune_old_snapshots(db_path: str, retention_days: int) -> None:
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "DELETE FROM fuel_snapshots WHERE captured_at < ?",
+            (cutoff.isoformat(),),
+        )
+        connection.commit()
+
+
 def load_history_points(db_path: str, timezone: ZoneInfo, history_days: int) -> dict[str, list[HistoryPoint]]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=history_days)
     latest_per_day: dict[tuple[str, dt.date], tuple[dt.datetime, float]] = {}
@@ -339,20 +356,51 @@ def calculate_alert_state(current_price: float, base_price: float, threshold: fl
     return state, deviation, deviation_ratio
 
 
-def build_history_chart_svg(
+def load_chart_font(size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = []
+    if os.name == "nt":
+        windows_dir = os.environ.get("WINDIR", "C:\\Windows")
+        candidates.extend(
+            [
+                os.path.join(windows_dir, "Fonts", "segoeuib.ttf" if bold else "segoeui.ttf"),
+                os.path.join(windows_dir, "Fonts", "arialbd.ttf" if bold else "arial.ttf"),
+            ]
+        )
+    candidates.extend(
+        [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ]
+    )
+
+    for path in candidates:
+        if os.path.exists(path):
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> tuple[int, int]:
+    left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+    return right - left, bottom - top
+
+
+def build_history_image(
     history_by_source: dict[str, list[HistoryPoint]],
     base_price: float,
     alert_threshold: float,
     history_days: int,
-) -> str:
+) -> bytes:
     all_points = [point for points in history_by_source.values() for point in points]
     if not all_points:
-        return ""
+        img = Image.new("RGB", (760, 260), "#f8fafc")
+        return BytesIO().getvalue()
 
-    ordered_days = sorted({point.day for point in all_points})[-history_days:]
-    if not ordered_days:
-        return ""
-
+    days_to_show = max(history_days, MIN_CHART_DAYS)
+    last_point_day = max(point.day for point in all_points)
+    ordered_days = [
+        last_point_day - dt.timedelta(days=offset)
+        for offset in range(days_to_show - 1, -1, -1)
+    ]
     lower_bound = base_price * (1 - alert_threshold)
     upper_bound = base_price * (1 + alert_threshold)
     values = [lower_bound, base_price, upper_bound] + [point.price for point in all_points]
@@ -363,130 +411,114 @@ def build_history_chart_svg(
     max_value += value_range * 0.12
     adjusted_range = max(max_value - min_value, 1.0)
 
-    palette = {"Украина": "#52525b", "Запорожская обл.": "#ef4444"}
+    width = 860
+    height = 410
+    left = 88
+    right = 28
+    top = 96
+    bottom = 64
+    plot_width = width - left - right
+    plot_height = height - top - bottom
 
-    width = 760
-    height = 280
-    plot_left = 54
-    plot_right = 22
-    plot_top = 18
-    plot_bottom = 42
-    plot_width = width - plot_left - plot_right
-    plot_height = height - plot_top - plot_bottom
-
-    def value_to_y(value: float) -> float:
+    def value_to_y(value: float) -> int:
         normalized = (value - min_value) / adjusted_range
         normalized = max(0.0, min(1.0, normalized))
-        return plot_top + (1 - normalized) * plot_height
+        return top + int((1 - normalized) * plot_height)
 
-    def day_to_x(index: int) -> float:
+    def day_to_x(index: int) -> int:
         if len(ordered_days) == 1:
-            return plot_left + plot_width / 2
-        return plot_left + (index * plot_width / (len(ordered_days) - 1))
+            return left + plot_width // 2
+        return left + int(index * plot_width / (len(ordered_days) - 1))
 
-    tick_count = 5
-    tick_step = adjusted_range / (tick_count - 1)
-    y_ticks = [min_value + tick_step * index for index in range(tick_count)]
+    palette = {"Украина": "#2563eb", "Запорожская обл.": "#dc2626"}
 
-    legend_items = []
+    img = Image.new("RGB", (width, height), "#f8fafc")
+    draw = ImageDraw.Draw(img)
+    font_small = load_chart_font(14)
+    font_regular = load_chart_font(18)
+    font_bold = load_chart_font(30, bold=True)
+    font_title = load_chart_font(16, bold=True)
+
+    draw.rectangle([0, 0, width, height], fill="#ffffff")
+    draw.rounded_rectangle([18, 18, width - 18, height - 18], radius=24, outline="#e2e8f0", width=1, fill="#ffffff")
+    draw.text((left, 34), "HISTORY", fill="#64748b", font=font_title)
+    draw.text((left, 60), f"Последние {days_to_show} дней", fill="#0f172a", font=font_bold)
+
+    legend_y = 42
+    legend_x = width - 360
     for source_name, color in palette.items():
-        if source_name in history_by_source:
-            legend_items.append(
-                f"<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:12px;border-radius:999px;background:{color};display:inline-block;'></span><span>{escape(source_name)}</span></div>"
-            )
-    legend_items.extend(
-        [
-            f"<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:2px;background:#16a34a;display:inline-block;'></span><span>Цель {base_price:.2f} грн/л</span></div>",
-            f"<div style='display:flex;align-items:center;gap:8px;'><span style='width:12px;height:2px;background:#86efac;display:inline-block;opacity:.8;'></span><span>Границы ±{alert_threshold * 100:.0f}%</span></div>",
-        ]
-    )
-
-    grid_lines = []
-    for tick_value in y_ticks:
-        y = value_to_y(tick_value)
-        grid_lines.append(
-            f"<line x1='{plot_left}' y1='{y:.1f}' x2='{plot_left + plot_width}' y2='{y:.1f}' stroke='#e2e8f0' stroke-width='1'/>"
-        )
-        grid_lines.append(
-            f"<text x='{plot_left - 10}' y='{y + 4:.1f}' text-anchor='end' font-size='11' fill='#64748b'>{tick_value:.0f}</text>"
-        )
-
-    day_labels = []
-    for index, day in enumerate(ordered_days):
-        x = day_to_x(index)
-        day_labels.append(
-            f"<text x='{x:.1f}' y='{height - 16}' text-anchor='middle' font-size='11' fill='#64748b'>{day.strftime('%b')}</text>"
-        )
-
-    source_paths = []
-    for source_name, color in palette.items():
-        points = history_by_source.get(source_name)
-        if not points:
+        if source_name not in history_by_source:
             continue
-
-        point_map = {point.day: point.price for point in points}
-        path_points = []
-        point_elements = []
-        for index, day in enumerate(ordered_days):
-            price_value = point_map.get(day)
-            if price_value is None:
-                continue
-            x = day_to_x(index)
-            y = value_to_y(price_value)
-            path_points.append((x, y, price_value))
-            point_elements.append(
-                f"<circle cx='{x:.1f}' cy='{y:.1f}' r='4.8' fill='#fff' stroke='{color}' stroke-width='2'/>"
-            )
-
-        if not path_points:
-            continue
-
-        path_d = "M " + " L ".join(f"{x:.1f} {y:.1f}" for x, y, _ in path_points)
-        last_x, last_y, last_value = path_points[-1]
-        source_paths.append(
-            f"""
-            <g>
-              <path d='{path_d}' fill='none' stroke='{color}' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/>
-              {''.join(point_elements)}
-              <circle cx='{last_x:.1f}' cy='{last_y:.1f}' r='7.5' fill='none' stroke='{color}' stroke-width='1' opacity='.18'/>
-              <text x='{last_x:.1f}' y='{last_y - 12:.1f}' text-anchor='middle' font-size='11' font-weight='700' fill='#0f172a'>{last_value:.2f}</text>
-            </g>
-            """
-        )
+        draw.ellipse([legend_x, legend_y + 6, legend_x + 12, legend_y + 18], fill=color)
+        draw.text((legend_x + 18, legend_y), source_name, fill="#475569", font=font_regular)
+        legend_x += 18 + text_size(draw, source_name, font_regular)[0] + 24
 
     target_y = value_to_y(base_price)
-    lower_y = value_to_y(lower_bound)
     upper_y = value_to_y(upper_bound)
+    lower_y = value_to_y(lower_bound)
 
-    return f"""
-    <div style='background:#fff;border:1px solid #e2e8f0;border-radius:18px;padding:16px 16px 12px;margin-top:18px;'>
-      <div style='display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px;flex-wrap:wrap;'>
-        <div>
-          <div style='font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#64748b;'>History</div>
-          <div style='font-size:18px;font-weight:700;color:#0f172a;'>Последние {history_days} дней</div>
-        </div>
-        <div style='display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:#475569;'>
-          {''.join(legend_items)}
-        </div>
-      </div>
-      <div style='overflow-x:auto;'>
-        <svg viewBox='0 0 {width} {height}' width='100%' height='auto' role='img' aria-label='График цен на дизельное топливо'>
-          <rect x='0' y='0' width='{width}' height='{height}' fill='#ffffff'/>
-          <line x1='{plot_left}' y1='{upper_y:.1f}' x2='{plot_left + plot_width}' y2='{upper_y:.1f}' stroke='#86efac' stroke-width='1' stroke-dasharray='2 6' opacity='.35'/>
-          <line x1='{plot_left}' y1='{target_y:.1f}' x2='{plot_left + plot_width}' y2='{target_y:.1f}' stroke='#16a34a' stroke-width='1.5'/>
-          <line x1='{plot_left}' y1='{lower_y:.1f}' x2='{plot_left + plot_width}' y2='{lower_y:.1f}' stroke='#86efac' stroke-width='1' stroke-dasharray='2 6' opacity='.35'/>
-          {''.join(grid_lines)}
-          <line x1='{plot_left}' y1='{plot_top}' x2='{plot_left}' y2='{plot_top + plot_height}' stroke='#cbd5e1' stroke-width='1'/>
-          <line x1='{plot_left}' y1='{plot_top + plot_height}' x2='{plot_left + plot_width}' y2='{plot_top + plot_height}' stroke='#cbd5e1' stroke-width='1'/>
-          {''.join(source_paths)}
-          {''.join(day_labels)}
-          <text x='{plot_left + plot_width - 4}' y='{target_y - 6:.1f}' text-anchor='end' font-size='11' fill='#15803d'>цель {base_price:.2f}</text>
-          <text x='{plot_left + plot_width - 4}' y='{upper_y - 6:.1f}' text-anchor='end' font-size='10' fill='#86efac' opacity='.75'>+{alert_threshold * 100:.0f}%</text>
-          <text x='{plot_left + plot_width - 4}' y='{lower_y + 14:.1f}' text-anchor='end' font-size='10' fill='#86efac' opacity='.75'>-{alert_threshold * 100:.0f}%</text>
-        </svg>
-      </div>
-    </div>
-    """
+    draw.rounded_rectangle([left, top - 8, left + plot_width, top + plot_height + 8], radius=18, fill="#f8fafc")
+
+    dash = 8
+    for x in range(left, left + plot_width, dash * 2):
+        draw.line([x, upper_y, min(x + dash, left + plot_width), upper_y], fill="#86efac", width=2)
+        draw.line([x, lower_y, min(x + dash, left + plot_width), lower_y], fill="#86efac", width=2)
+    draw.line([left, target_y, left + plot_width, target_y], fill="#16a34a", width=3)
+
+    for i in range(6):
+        y = top + i * (plot_height // 5)
+        draw.line([left, y, left + plot_width, y], fill="#e2e8f0", width=1)
+        label = f"{max_value - i * (adjusted_range / 5):.2f}"
+        label_width, label_height = text_size(draw, label, font_small)
+        draw.text((left - 16 - label_width, y - label_height // 2), label, fill="#64748b", font=font_small)
+
+    draw.line([left, top, left, top + plot_height], fill="#cbd5e1", width=1)
+    draw.line([left, top + plot_height, left + plot_width, top + plot_height], fill="#cbd5e1", width=1)
+    draw.text((34, top + plot_height // 2 - 8), "грн/л", fill="#64748b", font=font_regular)
+
+    for source_name, color in palette.items():
+        if source_name not in history_by_source:
+            continue
+        points = sorted(history_by_source[source_name], key=lambda point: point.day)
+        points = [point for point in points if point.day in ordered_days]
+        coords = []
+        for index, day in enumerate(ordered_days):
+            point = next((p for p in points if p.day == day), None)
+            if point is None:
+                continue
+            x = day_to_x(index)
+            y = value_to_y(point.price)
+            coords.append((x, y, point.price))
+
+        if len(coords) > 1:
+            line_points = [(coords[i][0], coords[i][1]) for i in range(len(coords))]
+            draw.line(line_points, fill=color, width=3)
+        for point_index, (x, y, price) in enumerate(coords):
+            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill="#ffffff", outline=color, width=2)
+            if point_index in {0, len(coords) - 1}:
+                value_label = f"{price:.2f}"
+                draw.text((x + 8, y - 22), value_label, fill=color, font=font_small)
+
+        if coords:
+            label_x, label_y, _ = coords[-1]
+            draw.text((label_x + 12, label_y - 2), source_name, fill=color, font=font_small)
+
+    for index, day in enumerate(ordered_days):
+        x = day_to_x(index)
+        date_label = day.strftime('%d.%m')
+        label_width, _ = text_size(draw, date_label, font_small)
+        draw.text((x - label_width // 2, height - bottom + 12), date_label, fill="#64748b", font=font_small)
+
+    target_label = f"Цель {base_price:.2f}"
+    upper_label = f"Верхняя граница +{alert_threshold * 100:.0f}%"
+    lower_label = f"Нижняя граница -{alert_threshold * 100:.0f}%"
+    draw.text((left + plot_width - text_size(draw, upper_label, font_small)[0], upper_y - 24), upper_label, fill="#86efac", font=font_small)
+    draw.text((left + plot_width - text_size(draw, target_label, font_regular)[0], target_y - 28), target_label, fill="#15803d", font=font_regular)
+    draw.text((left + plot_width - text_size(draw, lower_label, font_small)[0], lower_y + 8), lower_label, fill="#86efac", font=font_small)
+
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def load_smtp_settings() -> dict[str, str | int]:
@@ -580,11 +612,12 @@ def get_current_snapshots(sources: list[tuple[str, str]]) -> list[FuelSnapshot]:
 
 def run_cycle(sources: list[tuple[str, str]], db_path: str, smtp_settings: dict[str, str | int]) -> None:
     snapshots = get_current_snapshots(sources)
-    store_snapshots(db_path, snapshots)
     timezone = ZoneInfo(os.getenv("FUEL_TIMEZONE", DEFAULT_TIMEZONE))
     base_price = float(os.getenv("BASE_FUEL_PRICE", str(DEFAULT_BASE_FUEL_PRICE)))
     alert_threshold = float(os.getenv("FUEL_ALERT_THRESHOLD", str(DEFAULT_ALERT_THRESHOLD)))
     history_days = int(os.getenv("FUEL_HISTORY_DAYS", str(DEFAULT_HISTORY_DAYS)))
+    store_snapshots(db_path, snapshots)
+    prune_old_snapshots(db_path, history_days)
     history_by_source = load_history_points(db_path, timezone, history_days)
 
     sender = str(smtp_settings["sender"] or smtp_settings["username"] or "noreply@example.com")
@@ -648,6 +681,7 @@ def main() -> int:
 
     snapshots = get_current_snapshots(sources)
     store_snapshots(db_path, snapshots)
+    prune_old_snapshots(db_path, history_days)
     history_by_source = load_history_points(db_path, timezone, history_days)
     sender = str(smtp_settings["sender"] or smtp_settings["username"] or "noreply@example.com")
     recipient = str(smtp_settings["recipient"])
