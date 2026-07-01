@@ -14,6 +14,7 @@ from email.message import EmailMessage
 from html import escape
 from io import BytesIO
 from urllib.error import URLError
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -37,6 +38,8 @@ class FuelRow:
     price: str
     change: str | None = None
     change_percent: str | None = None
+    operator: str | None = None
+    operator_url: str | None = None
 
 
 @dataclass(slots=True)
@@ -134,11 +137,90 @@ def find_diesel_row(html_text: str) -> FuelRow:
     raise ValueError("Не удалось найти строку с дизельным топливом")
 
 
+def parse_price_value(price_text: str) -> float | None:
+    normalized = clean_text(price_text).replace(" ", "").replace(",", ".")
+    match = re.search(r"\d+(?:\.\d+)?", normalized)
+    if not match:
+        return None
+    return float(match.group(0))
+
+
+def find_operator_min_diesel_row(html_text: str) -> FuelRow | None:
+    operators_table_match = re.search(
+        r"<table[^>]*>.*?<caption>.*?цены операторов.*?</caption>(.*?)</table>",
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not operators_table_match:
+        return None
+
+    table_html = operators_table_match.group(1)
+    row_html_list = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, re.IGNORECASE | re.DOTALL)
+    if not row_html_list:
+        return None
+
+    header_cells: list[str] = []
+    for header_match in re.finditer(r"<th([^>]*)>(.*?)</th>", row_html_list[0], re.IGNORECASE | re.DOTALL):
+        attrs = header_match.group(1) or ""
+        text = clean_text(header_match.group(2))
+        colspan_match = re.search(r"colspan\s*=\s*['\"]?(\d+)", attrs, re.IGNORECASE)
+        colspan = int(colspan_match.group(1)) if colspan_match else 1
+        header_cells.extend([text] * max(colspan, 1))
+    diesel_index = next(
+        (
+            idx
+            for idx, value in enumerate(header_cells)
+            if value.strip().lower() in {"дт", "дизель", "дизельное топливо"}
+        ),
+        None,
+    )
+    if diesel_index is None:
+        return None
+
+    min_operator: str | None = None
+    min_operator_url: str | None = None
+    min_price_text: str | None = None
+    min_price_value: float | None = None
+
+    for row_html in row_html_list[1:]:
+        raw_cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, re.IGNORECASE | re.DOTALL)
+        cells = [clean_text(cell) for cell in raw_cells]
+        if not cells or len(cells) <= diesel_index:
+            continue
+
+        operator_name = cells[0]
+        operator_url = None
+        if raw_cells:
+            operator_link_match = re.search(r"<a[^>]+href=['\"]([^'\"]+)['\"]", raw_cells[0], re.IGNORECASE | re.DOTALL)
+            if operator_link_match:
+                operator_url = urljoin("https://index.minfin.com.ua", operator_link_match.group(1))
+        diesel_price_text = cells[diesel_index]
+        diesel_price_value = parse_price_value(diesel_price_text)
+        if diesel_price_value is None:
+            continue
+
+        if min_price_value is None or diesel_price_value < min_price_value:
+            min_price_value = diesel_price_value
+            min_price_text = diesel_price_text
+            min_operator = operator_name
+            min_operator_url = operator_url
+
+    if min_price_text is None or min_operator is None:
+        return None
+
+    return FuelRow(
+        name="Дизельное топливо",
+        price=min_price_text,
+        operator=min_operator,
+        operator_url=min_operator_url,
+    )
+
+
 def parse_snapshot(source_name: str, url: str) -> FuelSnapshot:
     html_text = fetch_html(url)
     title = first_match(r"<title>(.*?)</title>", html_text) or source_name
     updated_at = first_match(r"последнее обновление:\s*([^<]+)", html_text)
-    diesel = find_diesel_row(html_text)
+    diesel = find_operator_min_diesel_row(html_text) or find_diesel_row(html_text)
     return FuelSnapshot(
         source_name=source_name,
         url=url,
@@ -178,8 +260,10 @@ def build_message(
         display_source_name = localize_source_name(snapshot.source_name)
         price_value = float(snapshot.diesel.price.replace(",", "."))
         state, deviation, deviation_ratio = calculate_alert_state(price_value, base_price, alert_threshold)
+        operator_note = f" (оператор: {snapshot.diesel.operator})" if snapshot.diesel.operator else ""
+        operator_link_note = f" [{snapshot.diesel.operator_url}]" if snapshot.diesel.operator_url else ""
         parts = [
-            f"{display_source_name}: {snapshot.diesel.price} грн/л",
+            f"{display_source_name}: {snapshot.diesel.price} грн/л{operator_note}{operator_link_note}",
             f"відхилення {deviation:+.2f} грн ({deviation_ratio * 100:.2f}%)",
         ]
         if snapshot.diesel.change is not None:
@@ -207,6 +291,7 @@ def build_message(
                     <div style='padding:4px 10px;border-radius:999px;background:{badge_bg};color:{badge_fg};font-size:12px;font-weight:700;'>{'ОК' if state == 'ok' else 'ТРИВОГА'}</div>
                 </div>
                 <div style='margin-top:8px;font-size:28px;font-weight:800;color:#0f172a;'>{escape(snapshot.diesel.price)} <span style='font-size:14px;font-weight:600;color:#475569;'>грн/л</span></div>
+                {f"<div style='margin-top:2px;font-size:13px;color:#334155;'>Оператор: <a href='{escape(snapshot.diesel.operator_url)}' style='color:#1d4ed8;text-decoration:none;'>{escape(snapshot.diesel.operator)}</a></div>" if snapshot.diesel.operator and snapshot.diesel.operator_url else (f"<div style='margin-top:2px;font-size:13px;color:#334155;'>Оператор: {escape(snapshot.diesel.operator)}</div>" if snapshot.diesel.operator else "")}
                 <div style='margin-top:6px;font-size:13px;color:#475569;'>Відхилення від {base_price:.2f}: {deviation:+.2f} грн ({deviation_ratio * 100:.2f}%)</div>
             </div>
             """
