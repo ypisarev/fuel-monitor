@@ -408,7 +408,12 @@ def prune_old_snapshots(db_path: str, retention_days: int) -> None:
         connection.commit()
 
 
-def load_history_points(db_path: str, timezone: ZoneInfo, history_days: int) -> dict[str, list[HistoryPoint]]:
+def load_history_points(
+    db_path: str,
+    timezone: ZoneInfo,
+    history_days: int,
+    allowed_sources: set[str] | None = None,
+) -> dict[str, list[HistoryPoint]]:
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=history_days)
     latest_per_day: dict[tuple[str, dt.date], tuple[dt.datetime, float]] = {}
 
@@ -424,6 +429,8 @@ def load_history_points(db_path: str, timezone: ZoneInfo, history_days: int) -> 
         ).fetchall()
 
     for captured_at_text, source_name, price_text in rows:
+        if allowed_sources is not None and source_name not in allowed_sources:
+            continue
         captured_at = dt.datetime.fromisoformat(captured_at_text)
         local_day = captured_at.astimezone(timezone).date()
         price_value = float(str(price_text).replace(",", "."))
@@ -725,7 +732,13 @@ def run_cycle(sources: list[tuple[str, str]], db_path: str, smtp_settings: dict[
     history_days = int(os.getenv("FUEL_HISTORY_DAYS", str(DEFAULT_HISTORY_DAYS)))
     store_snapshots(db_path, snapshots)
     prune_old_snapshots(db_path, history_days)
-    history_by_source = load_history_points(db_path, timezone, history_days)
+    active_source_names = {source_name for source_name, _ in sources}
+    history_by_source = load_history_points(
+        db_path,
+        timezone,
+        history_days,
+        allowed_sources=active_source_names,
+    )
 
     sender = str(smtp_settings["sender"] or smtp_settings["username"] or "noreply@example.com")
     recipient = str(smtp_settings["recipient"])
@@ -764,7 +777,6 @@ def main() -> int:
     args = parser.parse_args()
 
     sources = [
-        ("Украина", "https://index.minfin.com.ua/markets/fuel/"),
         ("Запорожская обл.", "https://index.minfin.com.ua/markets/fuel/reg/zaporozhskaya/"),
     ]
 
@@ -789,7 +801,13 @@ def main() -> int:
     snapshots = get_current_snapshots(sources)
     store_snapshots(db_path, snapshots)
     prune_old_snapshots(db_path, history_days)
-    history_by_source = load_history_points(db_path, timezone, history_days)
+    active_source_names = {source_name for source_name, _ in sources}
+    history_by_source = load_history_points(
+        db_path,
+        timezone,
+        history_days,
+        allowed_sources=active_source_names,
+    )
     sender = str(smtp_settings["sender"] or smtp_settings["username"] or "noreply@example.com")
     recipient = str(smtp_settings["recipient"])
     message = build_message(

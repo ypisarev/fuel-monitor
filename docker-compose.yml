@@ -11,8 +11,11 @@ services:
       EMAIL_TO: ${EMAIL_TO:-yar.pisarev11@gmail.com}
       FUEL_DB_PATH: /data/fuel_monitor.sqlite3
       FUEL_TIMEZONE: ${FUEL_TIMEZONE:-Europe/Kyiv}
-      FUEL_SCHEDULE: ${FUEL_SCHEDULE:-*/5 * * * *}
+      FUEL_SCHEDULE: ${FUEL_SCHEDULE:-*/1 * * * *}
       SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      BASE_FUEL_PRICE: ${BASE_FUEL_PRICE:-73.99}
+      FUEL_ALERT_THRESHOLD: ${FUEL_ALERT_THRESHOLD:-0.05}
+      FUEL_HISTORY_DAYS: ${FUEL_HISTORY_DAYS:-14}
     volumes:
       - ./data:/data
     restart: unless-stopped
